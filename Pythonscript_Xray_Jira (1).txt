@@ -1,0 +1,852 @@
+import os
+import sys
+import json
+import csv
+import logging
+import configparser
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("ERROR: 'requests' package is required. Install with: pip install requests")
+    sys.exit(1)
+
+try:
+    from tabulate import tabulate
+except ImportError:
+    tabulate = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+DEFAULT_CONFIG = {
+    "JIRA_BASE_URL": "",
+    "JIRA_USERNAME": "",
+    "JIRA_API_TOKEN": "",
+    "JIRA_PLATFORM": "cloud",
+    "XRAY_CLIENT_ID": "",
+    "XRAY_CLIENT_SECRET": "",
+    "MONTHS_BACK": "4",
+    "EXCLUDE_PROJECTS": "",
+    "INCLUDE_PROJECTS": "",
+    "XRAY_ISSUE_TYPES": "Test,Test Set,Test Plan,Test Execution,Pre-Condition,Sub Test Execution",
+    "REGRESSION_LABELS": "regression,Regression,REGRESSION,regression-test,RegressionTest",
+    "FUNCTIONAL_LABELS": "functional,Functional,FUNCTIONAL,functional-test,FunctionalTest",
+    "TEST_TYPE_CUSTOM_FIELD": "",
+    "OUTPUT_DIR": "",
+    "OUTPUT_PREFIX": "xray_kpi",
+}
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+
+    config_path = Path(__file__).parent / "config.ini"
+    if config_path.exists():
+        parser = configparser.ConfigParser()
+        parser.read(str(config_path))
+        if "xray" in parser:
+            for key in config:
+                if key.lower() in parser["xray"]:
+                    config[key] = parser["xray"][key.lower()]
+        logger.info(f"Loaded configuration from {config_path}")
+
+    for key in config:
+        env_val = os.environ.get(key)
+        if env_val is not None:
+            config[key] = env_val
+
+    if not config["JIRA_BASE_URL"]:
+        logger.error("JIRA_BASE_URL is required. Set it in config.ini or as an environment variable.")
+        sys.exit(1)
+    if not config["JIRA_USERNAME"] or not config["JIRA_API_TOKEN"]:
+        logger.error("JIRA_USERNAME and JIRA_API_TOKEN are required.")
+        sys.exit(1)
+
+    config["JIRA_BASE_URL"] = config["JIRA_BASE_URL"].rstrip("/")
+
+    return config
+
+
+class JiraClient:
+
+    def __init__(self, config):
+        self.base_url = config["JIRA_BASE_URL"]
+        self.username = config["JIRA_USERNAME"]
+        self.api_token = config["JIRA_API_TOKEN"]
+        self.platform = config["JIRA_PLATFORM"].lower()
+        self.session = requests.Session()
+        self.session.auth = (self.username, self.api_token)
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        self.api_version = "3" if self.platform == "cloud" else "2"
+        self.api_base = f"{self.base_url}/rest/api/{self.api_version}"
+
+    def test_connection(self):
+        try:
+            resp = self.session.get(f"{self.api_base}/myself", timeout=15)
+            resp.raise_for_status()
+            user_data = resp.json()
+            display = user_data.get("displayName", user_data.get("name", "Unknown"))
+            logger.info(f"Connected to Jira as: {display}")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to connect to Jira: {e}")
+            return False
+
+    def search_jql(self, jql, fields=None, max_results=0, count_only=False):
+        if count_only:
+            return self._get_count(jql)
+        if max_results == 0:
+            return self._search_all(jql, fields)
+        else:
+            return self._search_page(jql, fields, 0, max_results)
+
+    def _get_count(self, jql):
+        params = {
+            "jql": jql,
+            "maxResults": 0,
+            "fields": "key",
+        }
+        try:
+            resp = self.session.get(f"{self.api_base}/search", params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json().get("total", 0)
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"JQL count failed for: {jql[:80]}... Error: {e}")
+            return 0
+
+    def _search_page(self, jql, fields, start_at, max_results):
+        params = {
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": max_results,
+        }
+        if fields:
+            params["fields"] = ",".join(fields) if isinstance(fields, list) else fields
+        resp = self.session.get(f"{self.api_base}/search", params=params, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _search_all(self, jql, fields):
+        all_issues = []
+        start_at = 0
+        page_size = 100
+
+        while True:
+            data = self._search_page(jql, fields, start_at, page_size)
+            issues = data.get("issues", [])
+            all_issues.extend(issues)
+            total = data.get("total", 0)
+
+            if start_at + len(issues) >= total:
+                break
+            start_at += page_size
+
+        return {"issues": all_issues, "total": len(all_issues)}
+
+    def get_projects(self):
+        try:
+            resp = self.session.get(f"{self.api_base}/project", timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch projects: {e}")
+            return []
+
+    def get_fields(self):
+        try:
+            resp = self.session.get(f"{self.api_base}/field", timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch fields: {e}")
+            return []
+
+
+class XrayCloudClient:
+
+    AUTH_URL = "https://xray.cloud.getxray.app/api/v2/authenticate"
+    GRAPHQL_URL = "https://xray.cloud.getxray.app/api/v2/graphql"
+
+    def __init__(self, client_id, client_secret):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.token = None
+        self.session = requests.Session()
+
+    def authenticate(self):
+        if not self.client_id or not self.client_secret:
+            logger.warning("Xray Cloud credentials not provided. Xray Cloud API features disabled.")
+            return False
+        try:
+            resp = self.session.post(
+                self.AUTH_URL,
+                json={"client_id": self.client_id, "client_secret": self.client_secret},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            self.token = resp.json()
+            if isinstance(self.token, str):
+                self.session.headers.update({"Authorization": f"Bearer {self.token}"})
+                logger.info("Authenticated with Xray Cloud API")
+                return True
+            else:
+                logger.error("Unexpected Xray auth response format")
+                return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Xray Cloud authentication failed: {e}")
+            return False
+
+    def graphql_query(self, query, variables=None):
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        try:
+            resp = self.session.post(self.GRAPHQL_URL, json=payload, timeout=60)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Xray GraphQL query failed: {e}")
+            return None
+
+    def get_test_coverage(self, project_key, start_date, end_date):
+        query = """
+        query GetTests($jql: String!, $limit: Int!) {
+            getTests(jql: $jql, limit: $limit) {
+                total
+                results {
+                    issueId
+                    testType { name }
+                    status { name }
+                }
+            }
+        }
+        """
+        jql = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND created >= "{start_date}" AND created <= "{end_date}"'
+        )
+        result = self.graphql_query(query, {"jql": jql, "limit": 100})
+        return result
+
+
+class XrayServerClient:
+
+    def __init__(self, jira_base_url, username, api_token):
+        self.base_url = f"{jira_base_url}/rest/raven/1.0"
+        self.session = requests.Session()
+        self.session.auth = (username, api_token)
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+
+    def get_test_runs(self, test_exec_key):
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/testexec/{test_exec_key}/test",
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to get test runs for {test_exec_key}: {e}")
+            return []
+
+    def get_test_plan_tests(self, test_plan_key):
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/testplan/{test_plan_key}/test",
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to get tests for plan {test_plan_key}: {e}")
+            return []
+
+
+def get_month_ranges(months_back=4):
+    today = datetime.now()
+    ranges = []
+
+    for i in range(months_back, 0, -1):
+        first_day = (today - relativedelta(months=i)).replace(day=1)
+        if i == 1:
+            last_day = today.replace(day=1) - timedelta(days=1)
+        else:
+            last_day = (first_day + relativedelta(months=1)) - timedelta(days=1)
+
+        ranges.append({
+            "month_label": first_day.strftime("%b-%Y"),
+            "month_num": first_day.month,
+            "year": first_day.year,
+            "start_date": first_day.strftime("%Y-%m-%d"),
+            "end_date": last_day.strftime("%Y-%m-%d"),
+        })
+
+    current_first = today.replace(day=1)
+    ranges.append({
+        "month_label": current_first.strftime("%b-%Y"),
+        "month_num": current_first.month,
+        "year": current_first.year,
+        "start_date": current_first.strftime("%Y-%m-%d"),
+        "end_date": today.strftime("%Y-%m-%d"),
+    })
+
+    return ranges
+
+
+def discover_xray_projects(jira_client, config):
+    xray_types = [t.strip() for t in config["XRAY_ISSUE_TYPES"].split(",")]
+    include_projects = [p.strip() for p in config["INCLUDE_PROJECTS"].split(",") if p.strip()]
+    exclude_projects = [p.strip() for p in config["EXCLUDE_PROJECTS"].split(",") if p.strip()]
+
+    logger.info("Discovering Jira projects with Xray test cases...")
+
+    type_filter = ", ".join([f'"{t}"' for t in xray_types])
+    jql = f"issuetype in ({type_filter})"
+
+    if include_projects:
+        proj_filter = ", ".join([f'"{p}"' for p in include_projects])
+        jql += f" AND project in ({proj_filter})"
+
+    jql += " ORDER BY project ASC"
+
+    logger.info(f"Discovery JQL: {jql}")
+
+    all_projects = jira_client.get_projects()
+    xray_projects = []
+
+    if include_projects:
+        candidate_projects = [p for p in all_projects if p["key"] in include_projects]
+    else:
+        candidate_projects = all_projects
+
+    logger.info(f"Checking {len(candidate_projects)} projects for Xray issue types...")
+
+    for proj in candidate_projects:
+        proj_key = proj["key"]
+        proj_name = proj.get("name", proj_key)
+
+        if proj_key in exclude_projects:
+            continue
+
+        proj_jql = f'project = "{proj_key}" AND issuetype in ({type_filter})'
+        count = jira_client.search_jql(proj_jql, count_only=True)
+
+        if count > 0:
+            xray_projects.append({
+                "key": proj_key,
+                "name": proj_name,
+                "total_xray_issues": count,
+            })
+            logger.info(f"  {proj_key} ({proj_name}): {count} Xray issues")
+        else:
+            logger.debug(f"  {proj_key}: no Xray issues")
+
+    logger.info(f"Found {len(xray_projects)} projects with Xray test cases")
+    return xray_projects
+
+
+def detect_test_type_field(jira_client, config):
+    if config["TEST_TYPE_CUSTOM_FIELD"]:
+        logger.info(f"Using configured Test Type field: {config['TEST_TYPE_CUSTOM_FIELD']}")
+        return config["TEST_TYPE_CUSTOM_FIELD"]
+
+    logger.info("Auto-detecting Xray Test Type custom field...")
+    fields = jira_client.get_fields()
+
+    test_type_names = [
+        "Test Type",
+        "Xray Test Type",
+        "test type",
+        "testtype",
+    ]
+
+    for field in fields:
+        field_name = field.get("name", "").strip()
+        field_id = field.get("id", "")
+
+        if field_name.lower() in [n.lower() for n in test_type_names]:
+            logger.info(f"Found Test Type field: {field_name} -> {field_id}")
+            return field_id
+
+    for field in fields:
+        field_name = field.get("name", "").lower()
+        if "test" in field_name and "type" in field_name and field.get("custom", False):
+            field_id = field.get("id", "")
+            logger.info(f"Found probable Test Type field: {field.get('name')} -> {field_id}")
+            return field_id
+
+    logger.warning(
+        "Could not auto-detect Test Type field. "
+        "Set TEST_TYPE_CUSTOM_FIELD in config. "
+        "Falling back to label-based classification."
+    )
+    return None
+
+
+def collect_metrics_for_project(jira_client, xray_cloud_client, project_key, month_range, test_type_field, config):
+    start = month_range["start_date"]
+    end = month_range["end_date"]
+
+    regression_labels = [l.strip() for l in config["REGRESSION_LABELS"].split(",") if l.strip()]
+    functional_labels = [l.strip() for l in config["FUNCTIONAL_LABELS"].split(",") if l.strip()]
+
+    metrics = {
+        "project_key": project_key,
+        "month": month_range["month_label"],
+        "month_num": month_range["month_num"],
+        "year": month_range["year"],
+        "start_date": start,
+        "end_date": end,
+    }
+
+    jql_total = (
+        f'project = "{project_key}" AND issuetype = "Test" '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["total_tests"] = jira_client.search_jql(jql_total, count_only=True)
+
+    if test_type_field:
+        jql_manual = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND "{test_type_field}" = "Manual" '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        try:
+            metrics["manual_tests"] = jira_client.search_jql(jql_manual, count_only=True)
+        except Exception:
+            jql_manual = (
+                f'project = "{project_key}" AND issuetype = "Test" '
+                f'AND testType = "Manual" '
+                f'AND created >= "{start}" AND created <= "{end}"'
+            )
+            metrics["manual_tests"] = jira_client.search_jql(jql_manual, count_only=True)
+    else:
+        jql_manual = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND testType = "Manual" '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        metrics["manual_tests"] = jira_client.search_jql(jql_manual, count_only=True)
+
+    if test_type_field:
+        jql_auto = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND "{test_type_field}" = "Generic" '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        try:
+            metrics["automated_tests"] = jira_client.search_jql(jql_auto, count_only=True)
+        except Exception:
+            jql_auto = (
+                f'project = "{project_key}" AND issuetype = "Test" '
+                f'AND testType = "Generic" '
+                f'AND created >= "{start}" AND created <= "{end}"'
+            )
+            metrics["automated_tests"] = jira_client.search_jql(jql_auto, count_only=True)
+    else:
+        jql_auto = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND testType = "Generic" '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        metrics["automated_tests"] = jira_client.search_jql(jql_auto, count_only=True)
+
+    if test_type_field:
+        jql_cucumber = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND "{test_type_field}" = "Cucumber" '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        try:
+            metrics["cucumber_tests"] = jira_client.search_jql(jql_cucumber, count_only=True)
+        except Exception:
+            jql_cucumber = (
+                f'project = "{project_key}" AND issuetype = "Test" '
+                f'AND testType = "Cucumber" '
+                f'AND created >= "{start}" AND created <= "{end}"'
+            )
+            metrics["cucumber_tests"] = jira_client.search_jql(jql_cucumber, count_only=True)
+    else:
+        jql_cucumber = (
+            f'project = "{project_key}" AND issuetype = "Test" '
+            f'AND testType = "Cucumber" '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        metrics["cucumber_tests"] = jira_client.search_jql(jql_cucumber, count_only=True)
+
+    label_filter = " OR ".join([f'labels = "{lbl}"' for lbl in regression_labels])
+    jql_regression = (
+        f'project = "{project_key}" AND issuetype = "Test" '
+        f'AND ({label_filter}) '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["regression_tests"] = jira_client.search_jql(jql_regression, count_only=True)
+
+    func_label_filter = " OR ".join([f'labels = "{lbl}"' for lbl in functional_labels])
+    jql_functional = (
+        f'project = "{project_key}" AND issuetype = "Test" '
+        f'AND ({func_label_filter}) '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["functional_tests"] = jira_client.search_jql(jql_functional, count_only=True)
+
+    jql_exec = (
+        f'project = "{project_key}" AND issuetype = "Test Execution" '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["total_test_executions"] = jira_client.search_jql(jql_exec, count_only=True)
+
+    jql_plan = (
+        f'project = "{project_key}" AND issuetype = "Test Plan" '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["total_test_plans"] = jira_client.search_jql(jql_plan, count_only=True)
+
+    jql_set = (
+        f'project = "{project_key}" AND issuetype = "Test Set" '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["total_test_sets"] = jira_client.search_jql(jql_set, count_only=True)
+
+    jql_req_with_tests = (
+        f'project = "{project_key}" '
+        f'AND issuetype in ("Story", "Requirement", "Epic", "Bug") '
+        f'AND issueFunction in tested() '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    try:
+        metrics["requirements_with_tests"] = jira_client.search_jql(jql_req_with_tests, count_only=True)
+    except Exception:
+        jql_req_with_tests = (
+            f'project = "{project_key}" '
+            f'AND issuetype in ("Story", "Requirement", "Epic", "Bug") '
+            f'AND issue in linkedIssuesOf("issuetype = Test") '
+            f'AND created >= "{start}" AND created <= "{end}"'
+        )
+        try:
+            metrics["requirements_with_tests"] = jira_client.search_jql(jql_req_with_tests, count_only=True)
+        except Exception:
+            metrics["requirements_with_tests"] = 0
+            logger.warning(f"Could not determine coverage for {project_key} in {month_range['month_label']}")
+
+    jql_total_req = (
+        f'project = "{project_key}" '
+        f'AND issuetype in ("Story", "Requirement", "Epic", "Bug") '
+        f'AND created >= "{start}" AND created <= "{end}"'
+    )
+    metrics["total_requirements"] = jira_client.search_jql(jql_total_req, count_only=True)
+
+    if metrics["total_requirements"] > 0:
+        metrics["coverage_percent"] = round(
+            (metrics["requirements_with_tests"] / metrics["total_requirements"]) * 100, 2
+        )
+    else:
+        metrics["coverage_percent"] = 0.0
+
+    if metrics["total_tests"] > 0:
+        metrics["automation_rate_percent"] = round(
+            ((metrics["automated_tests"] + metrics["cucumber_tests"]) / metrics["total_tests"]) * 100, 2
+        )
+    else:
+        metrics["automation_rate_percent"] = 0.0
+
+    return metrics
+
+
+def print_project_discovery(projects):
+    print("\n" + "=" * 70)
+    print("  JIRA PROJECTS WITH XRAY TEST CASES")
+    print("=" * 70)
+
+    if tabulate:
+        headers = ["#", "Project Key", "Project Name", "Total Xray Issues"]
+        rows = [
+            [i + 1, p["key"], p["name"], p["total_xray_issues"]]
+            for i, p in enumerate(projects)
+        ]
+        print(tabulate(rows, headers=headers, tablefmt="grid"))
+    else:
+        print(f"{'#':<4} {'Project Key':<15} {'Project Name':<30} {'Xray Issues':<12}")
+        print("-" * 65)
+        for i, p in enumerate(projects):
+            print(f"{i+1:<4} {p['key']:<15} {p['name']:<30} {p['total_xray_issues']:<12}")
+
+    print(f"\nTotal: {len(projects)} projects\n")
+
+
+def print_metrics_table(all_metrics):
+    if not all_metrics:
+        print("No metrics collected.")
+        return
+
+    print("\n" + "=" * 120)
+    print("  XRAY KPI METRICS - MONTHLY BREAKDOWN")
+    print("=" * 120)
+
+    by_project = defaultdict(list)
+    for m in all_metrics:
+        by_project[m["project_key"]].append(m)
+
+    for project_key, months_data in by_project.items():
+        print(f"\n--- Project: {project_key} ---")
+
+        if tabulate:
+            headers = [
+                "Month",
+                "Total Tests",
+                "Manual",
+                "Automated",
+                "Cucumber",
+                "Regression",
+                "Functional",
+                "Exec",
+                "Plans",
+                "Coverage %",
+                "Auto Rate %",
+            ]
+            rows = [
+                [
+                    m["month"],
+                    m["total_tests"],
+                    m["manual_tests"],
+                    m["automated_tests"],
+                    m["cucumber_tests"],
+                    m["regression_tests"],
+                    m["functional_tests"],
+                    m["total_test_executions"],
+                    m["total_test_plans"],
+                    f'{m["coverage_percent"]:.1f}%',
+                    f'{m["automation_rate_percent"]:.1f}%',
+                ]
+                for m in sorted(months_data, key=lambda x: (x["year"], x["month_num"]))
+            ]
+            print(tabulate(rows, headers=headers, tablefmt="grid"))
+        else:
+            fmt = (
+                "{month:<10} | Tests: {total_tests:<5} | Manual: {manual_tests:<5} | "
+                "Auto: {automated_tests:<5} | Cucumber: {cucumber_tests:<5} | "
+                "Regression: {regression_tests:<5} | Functional: {functional_tests:<5} | "
+                "Coverage: {coverage_percent:.1f}% | AutoRate: {automation_rate_percent:.1f}%"
+            )
+            for m in sorted(months_data, key=lambda x: (x["year"], x["month_num"])):
+                print(fmt.format(**m))
+
+
+def print_summary(all_metrics):
+    if not all_metrics:
+        return
+
+    print("\n" + "=" * 80)
+    print("  AGGREGATE SUMMARY (ALL PROJECTS)")
+    print("=" * 80)
+
+    by_month = defaultdict(lambda: defaultdict(int))
+    for m in all_metrics:
+        key = m["month"]
+        for field in ["total_tests", "manual_tests", "automated_tests", "cucumber_tests",
+                       "regression_tests", "functional_tests", "total_test_executions",
+                       "total_test_plans", "total_requirements", "requirements_with_tests"]:
+            by_month[key][field] += m[field]
+        by_month[key]["month_num"] = m["month_num"]
+        by_month[key]["year"] = m["year"]
+
+    sorted_months = sorted(by_month.items(), key=lambda x: (x[1]["year"], x[1]["month_num"]))
+
+    if tabulate:
+        headers = ["Month", "Total Tests", "Manual", "Automated", "Cucumber",
+                    "Regression", "Functional", "Executions", "Coverage %", "Auto Rate %"]
+        rows = []
+        for label, data in sorted_months:
+            cov = (data["requirements_with_tests"] / data["total_requirements"] * 100) if data["total_requirements"] > 0 else 0
+            auto_rate = ((data["automated_tests"] + data["cucumber_tests"]) / data["total_tests"] * 100) if data["total_tests"] > 0 else 0
+            rows.append([
+                label, data["total_tests"], data["manual_tests"], data["automated_tests"],
+                data["cucumber_tests"], data["regression_tests"], data["functional_tests"],
+                data["total_test_executions"], f"{cov:.1f}%", f"{auto_rate:.1f}%"
+            ])
+        print(tabulate(rows, headers=headers, tablefmt="grid"))
+    else:
+        for label, data in sorted_months:
+            cov = (data["requirements_with_tests"] / data["total_requirements"] * 100) if data["total_requirements"] > 0 else 0
+            auto_rate = ((data["automated_tests"] + data["cucumber_tests"]) / data["total_tests"] * 100) if data["total_tests"] > 0 else 0
+            print(f"{label}: Tests={data['total_tests']}, Manual={data['manual_tests']}, "
+                  f"Auto={data['automated_tests']}, Cucumber={data['cucumber_tests']}, "
+                  f"Coverage={cov:.1f}%, AutoRate={auto_rate:.1f}%")
+
+
+def save_to_csv(all_metrics, output_path):
+    if not all_metrics:
+        return
+
+    fieldnames = [
+        "project_key", "month", "year", "month_num", "start_date", "end_date",
+        "total_tests", "manual_tests", "automated_tests", "cucumber_tests",
+        "regression_tests", "functional_tests", "total_test_executions",
+        "total_test_plans", "total_test_sets", "total_requirements",
+        "requirements_with_tests", "coverage_percent", "automation_rate_percent",
+    ]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(sorted(all_metrics, key=lambda x: (x["project_key"], x["year"], x["month_num"])))
+
+    logger.info(f"CSV saved to: {output_path}")
+
+
+def save_to_json(all_metrics, projects, output_path):
+    output = {
+        "extracted_at": datetime.now().isoformat(),
+        "months_covered": sorted(list(set(m["month"] for m in all_metrics))),
+        "projects": projects,
+        "metrics": sorted(all_metrics, key=lambda x: (x["project_key"], x["year"], x["month_num"])),
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, default=str)
+
+    logger.info(f"JSON saved to: {output_path}")
+
+
+def save_mongodb_documents(all_metrics, output_path):
+    docs = []
+    for m in all_metrics:
+        doc = {
+            **m,
+            "extracted_at": datetime.now().isoformat(),
+            "_id": f"{m['project_key']}_{m['year']}_{m['month_num']:02d}",
+        }
+        docs.append(doc)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(docs, f, indent=2, default=str)
+
+    logger.info(f"MongoDB-ready JSON saved to: {output_path}")
+
+
+def main():
+    print("""
+    XRAY KPI METRICS EXTRACTOR
+    Jira + Xray Test Management - Monthly KPI Dashboard
+    """)
+
+    config = load_config()
+
+    output_dir = config["OUTPUT_DIR"] or str(Path(__file__).parent)
+    os.makedirs(output_dir, exist_ok=True)
+
+    jira = JiraClient(config)
+    if not jira.test_connection():
+        logger.error("Cannot connect to Jira. Please check your credentials and URL.")
+        sys.exit(1)
+
+    xray_cloud = None
+    xray_server = None
+
+    if config["JIRA_PLATFORM"] == "cloud":
+        if config["XRAY_CLIENT_ID"] and config["XRAY_CLIENT_SECRET"]:
+            xray_cloud = XrayCloudClient(config["XRAY_CLIENT_ID"], config["XRAY_CLIENT_SECRET"])
+            xray_cloud.authenticate()
+        else:
+            logger.info("Xray Cloud credentials not provided. Using Jira JQL only.")
+    else:
+        xray_server = XrayServerClient(
+            config["JIRA_BASE_URL"], config["JIRA_USERNAME"], config["JIRA_API_TOKEN"]
+        )
+
+    logger.info("=" * 60)
+    logger.info("STEP 1: Discovering projects with Xray test cases")
+    logger.info("=" * 60)
+
+    projects = discover_xray_projects(jira, config)
+    if not projects:
+        logger.error("No projects found with Xray test cases. Exiting.")
+        sys.exit(0)
+
+    print_project_discovery(projects)
+
+    logger.info("STEP 2: Detecting Xray Test Type custom field")
+    test_type_field = detect_test_type_field(jira, config)
+
+    months_back = int(config["MONTHS_BACK"])
+    month_ranges = get_month_ranges(months_back)
+    logger.info(f"Collecting metrics for months: {', '.join(m['month_label'] for m in month_ranges)}")
+
+    logger.info("=" * 60)
+    logger.info("STEP 3: Collecting KPI metrics per project per month")
+    logger.info("=" * 60)
+
+    all_metrics = []
+    total_queries = len(projects) * len(month_ranges)
+    completed = 0
+
+    for proj in projects:
+        proj_key = proj["key"]
+        logger.info(f"\nProcessing project: {proj_key} ({proj['name']})")
+
+        for month in month_ranges:
+            completed += 1
+            logger.info(f"  [{completed}/{total_queries}] {proj_key} - {month['month_label']}")
+
+            try:
+                metrics = collect_metrics_for_project(
+                    jira, xray_cloud, proj_key, month, test_type_field, config
+                )
+                all_metrics.append(metrics)
+            except Exception as e:
+                logger.error(f"  ERROR collecting metrics for {proj_key} {month['month_label']}: {e}")
+                all_metrics.append({
+                    "project_key": proj_key,
+                    "month": month["month_label"],
+                    "month_num": month["month_num"],
+                    "year": month["year"],
+                    "start_date": month["start_date"],
+                    "end_date": month["end_date"],
+                    "total_tests": 0, "manual_tests": 0, "automated_tests": 0,
+                    "cucumber_tests": 0, "regression_tests": 0, "functional_tests": 0,
+                    "total_test_executions": 0, "total_test_plans": 0, "total_test_sets": 0,
+                    "total_requirements": 0, "requirements_with_tests": 0,
+                    "coverage_percent": 0.0, "automation_rate_percent": 0.0,
+                    "error": str(e),
+                })
+
+    print_metrics_table(all_metrics)
+    print_summary(all_metrics)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = config["OUTPUT_PREFIX"]
+
+    csv_path = os.path.join(output_dir, f"{prefix}_{timestamp}.csv")
+    json_path = os.path.join(output_dir, f"{prefix}_{timestamp}.json")
+    mongo_path = os.path.join(output_dir, f"{prefix}_mongodb_{timestamp}.json")
+
+    save_to_csv(all_metrics, csv_path)
+    save_to_json(all_metrics, projects, json_path)
+    save_mongodb_documents(all_metrics, mongo_path)
+
+    print(f"\n{'=' * 60}")
+    print("  OUTPUT FILES")
+    print(f"{'=' * 60}")
+    print(f"  CSV:     {csv_path}")
+    print(f"  JSON:    {json_path}")
+    print(f"  MongoDB: {mongo_path}")
+    print(f"{'=' * 60}\n")
+
+
+if __name__ == "__main__":
+    main()
