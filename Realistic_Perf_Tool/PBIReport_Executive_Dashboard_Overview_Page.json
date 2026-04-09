@@ -1,0 +1,154 @@
+reportParameters= {
+  "reportUrl": "https://app.powerbi.com/reportEmbed?reportId=d8ad9b12-30ae-46d7-b1c2-06349ce1bf5a&groupId=a1a30dbf-fffd-4675-ab80-e9819c18e0ed&w=2&config=eyJjbHVzdGVyVXJsIjoiaHR0cHM6Ly9XQUJJLVVTLU5PUlRILUNFTlRSQUwtRC1QUklNQVJZLXJlZGlyZWN0LmFuYWx5c2lzLndpbmRvd3MubmV0IiwiZW1iZWRGZWF0dXJlcyI6eyJ1c2FnZU1ldHJpY3NWTmV4dCI6dHJ1ZX19", 
+  "pageName": "e662d29d89c8bbd21893",
+  "sessionRestart": 100,
+  "thinkTimeSeconds": 10,
+  "filters": [
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Business Unit"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 12 Months"
+        ]
+      }
+    ],
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Location"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 12 Months"
+        ]
+      }
+    ],
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Segment"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 12 Months"
+        ]
+      }
+    ],    
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Dynamic Calendar"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 12 Months"
+        ]
+      }
+    ],
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Business Unit"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 6 Months"
+        ]
+      }
+    ],
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Location"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 6 Months"
+        ]
+      }
+    ],
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Segment"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 6 Months"
+        ]
+      }
+    ],
+    [
+      {
+        "filterTable": "_dynamic LOB",
+        "filterColumn": "Parameter Fields",
+        "isSlicer": true,
+        "filtersList": [
+          "Dynamic Calendar"
+        ]
+      },
+      {
+        "filterTable": "dim_dynamic_calendar",
+        "filterColumn": "Periods",
+        "isSlicer": true,
+        "filtersList": [
+          "Last 6 Months"
+        ]
+      }
+    ]
+  ]
+};
+
+//see DemoLoadTest1/PBIReport.JSON and DemoLoadTest2/PBIReport.JSON for examples of how to define which page it should show, which bookmarks to click through, which filters and slicers to select
