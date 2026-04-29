@@ -10,9 +10,14 @@ import os
 import json
 import random
 from datetime import datetime
-
+import inspect
 import config as cfg
-import custom as custcode
+from custom import api_requests
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ══════════════════════════════════════════════════════════════
 #  COLOUR PALETTE  (light theme)
@@ -37,34 +42,56 @@ FONT_MONO   = ("Consolas", 9)
 # ══════════════════════════════════════════════════════════════
 #  LOGGING HELPER
 # ══════════════════════════════════════════════════════════════
-def log_performance(test_name, thread_name, iteration,
-                    start_time, end_time,
-                    samples_started, samples_completed, active_threads,
-                    think_time, response_time, error_status,
-                    error_percent, response_status_code, response):
+def log_performance(test_name,
+                    thread_name, iteration, start_time, end_time,
+                    samples_started, samples_completed, active_threads,think_time,
+                    response_time, error_status, error_percent, response_status_code, response):
     db_conn = sqlite3.connect(f"./db/{cfg.db_filename}")
     db_cursor = db_conn.cursor()
+
     db_cursor.execute("""
-        INSERT INTO performance (suite_name, test_name, max_threads,
-            thread_name, iteration, start_time, end_time,
-            samples_started, samples_completed, active_threads,
-            think_time, response_time, error_status, error_percent,
-            response_status_code, response)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (cfg.suite_id, test_name, cfg.users, thread_name, iteration,
-          start_time, end_time, samples_started, samples_completed,
-          active_threads, think_time, response_time, error_status,
-          error_percent, response_status_code, response))
+            INSERT INTO performance (suite_name,
+            test_name, max_threads, thread_name, iteration, start_time,
+            end_time, samples_started, samples_completed, active_threads,
+            think_time, response_time, error_status, error_percent, response_status_code,
+            response ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,?, ?, ?,?,?,?,?)
+            """,
+                      (cfg.suite_id, test_name, cfg.users, thread_name, iteration, start_time, end_time,
+                       samples_started, samples_completed, active_threads,
+                       think_time, response_time, error_status, error_percent, response_status_code, response))
+
     db_conn.commit()
     db_conn.close()
 
+
+
+def task_propotion(lst, users, weights):
+    total = sum(weights)
+    w_users=int(round(random.choice([.2,.25,.3,.35,.4,.45,.5,.55])))
+    percentages = [round((w / total) * (users+w_users), 0) for w in weights]
+    d_list = []
+
+    for i in range(len(lst)):
+        p = percentages[i]
+        for j in range(int(p)):
+            d_list.append(lst[i])
+
+    #if len(d_list) > users:
+    #    d_list = d_list[:users]
+
+    while len(d_list) < users:
+        d_list.append(random.choices(lst, weights)[0])
+
+    random.shuffle(d_list)
+    return d_list
 
 # ══════════════════════════════════════════════════════════════
 #  WORKER THREAD
 # ══════════════════════════════════════════════════════════════
 class UserThread:
-    def __init__(self, thread_name, log_fn):
+    def __init__(self, thread_name, thread_task, log_fn):
         self.thread_name = thread_name
+        self.thread_task=thread_task
         self.log = log_fn
 
     def run(self):
@@ -80,13 +107,15 @@ class UserThread:
 
             (resp, status_code, error_flag, think_time, test_name,
              start_time, start_time_pc, end_time, end_time_pc,
-             response_time) = custcode.api_request_main(user_session)
+             response_time) = self.api_request_main(user_session, self.thread_task)
 
             cfg.samples_completed += 1
             if error_flag in cfg.error_flags:
                 cfg.current_errors += 1
                 self.log(f"❌  [{self.thread_name}]  {test_name}  │  {status_code}  │  {response_time:.2f} ms", "err")
             else:
+                cfg.total_response_time += (response_time/1000)
+                cfg.avg = cfg.total_response_time / cfg.samples_completed if cfg.samples_completed > 0 else 0
                 self.log(f"✅  [{self.thread_name}]  {test_name}  │  {status_code}  │  {response_time:.2f} ms", "ok")
 
             cfg.error_percent = (cfg.current_errors / cfg.samples_started) * 100
@@ -94,27 +123,89 @@ class UserThread:
             log_performance(test_name, self.thread_name, i,
                             start_time.strftime("%Y-%m-%d %H:%M:%S.%f"),
                             end_time.strftime("%Y-%m-%d %H:%M:%S.%f"),
-                            cfg.samples_started, cfg.samples_completed,
-                            cfg.running_users, think_time * 1000,
-                            response_time, error_flag, cfg.error_percent,
-                            status_code, str(resp))
+                            cfg.samples_started,
+                            cfg.samples_completed,
+                            cfg.running_users,
+                            think_time * 1000,
+                            response_time,
+                            error_flag,
+                            cfg.error_percent,
+                            status_code,
+                            str(resp))
 
         if not cfg.stop_requested and \
            (time.time() - cfg.test_start_time) >= (cfg.runfor * 60):
             cfg.running_users -= 1
 
+    def api_request_main(self, user_session, f):
+        tt = random.choice(cfg.think_time)
+        start_time = None
+        start_time_pc = None
+        end_time = None
+        end_time_pc = None
+        response_time = None
+        test_name = None
+        try:
 
+            time.sleep(tt)
+            start_time = datetime.now()
+            start_time_pc = time.perf_counter()
+
+            resp, test_name = f(user_session)
+
+            end_time = datetime.now()
+            end_time_pc = time.perf_counter()
+            response_time = (end_time_pc - start_time_pc) * 1000
+
+            if resp is not None:
+                try:
+                    resp_content = resp.json()
+                except ValueError:
+                    resp_content = resp.text
+
+                status_code = resp.status_code
+                error_flag = 0 if resp.status_code in cfg.valid_status_codes + cfg.ignore_status_codes else 1
+
+                status_code = resp.status_code
+                error_flag = ""
+                if resp.status_code in cfg.valid_status_codes:
+                    error_flag = "P"
+                elif resp.status_code in cfg.ignore_status_codes:
+                    error_flag = "W"
+                else:
+                    error_flag = "F"
+
+                return resp_content, status_code, error_flag, tt, test_name, start_time, start_time_pc, end_time, end_time_pc, response_time
+            else:
+                return "None", "0", "W", tt, test_name, start_time, start_time_pc, end_time, end_time_pc, response_time
+
+        except Exception as e:
+            print(e)
+            return str(e), 0, 1, tt, test_name, start_time, start_time_pc, end_time, end_time_pc, response_time
+            
+            
 # ══════════════════════════════════════════════════════════════
 #  MAIN UI CLASS
 # ══════════════════════════════════════════════════════════════
 class BenchUI:
     def __init__(self, root):
+        self.users=0
         self.root = root
         self.root.title("⚡ Performance Bench Test — Control Panel")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
-        self.root.minsize(820, 680)
+        self.root.minsize(1100, 720)
         self._stop_flag = False
+        self._test_done_flag=False
+
+        # ── Live chart history buffers ──────────────────────
+        self._chart_time   = []
+        self._chart_avg_rt = []
+        self._chart_tps    = []
+        self._chart_tpm    = []
+        self._chart_eff    = []
+        self._MAX_POINTS   = 120
+
         self._apply_ttk_theme()
         self._build_ui()
 
@@ -218,7 +309,6 @@ class BenchUI:
         for r, (lbl, key, val) in enumerate(fields_right):
             self._param_row(param_outer, lbl, key, val, r, 2)
 
-        # hint
         tk.Label(param_outer,
                  text="💡  Lists accepted for ramp-up & think time e.g.  [2, 4, 6, 8]",
                  bg=BG2, fg=TEXT_DIM, font=("Segoe UI", 8, "italic")
@@ -239,7 +329,7 @@ class BenchUI:
                                    state="disabled")
         self.btn_stop.grid(row=0, column=1, padx=8)
 
-        ttk.Button(btn_frame, text="🗑   Clear Log",
+        ttk.Button(btn_frame, text="🗑   Clear",
                    style="Clear.TButton",
                    command=self._clear_log).grid(row=0, column=2, padx=8)
 
@@ -266,13 +356,20 @@ class BenchUI:
         self.lbl_errors    = self._card(cards_frame, "ERRORS",        "—",  RED,    2)
         self.lbl_error_pct = self._card(cards_frame, "ERROR RATE",    "—",  YELLOW, 3)
         self.lbl_elapsed   = self._card(cards_frame, "ELAPSED",       "—",  WHITE,  4)
-        self.lbl_db        = self._card(cards_frame, "DATABASE",      "—",  TEXT_DIM, 5)
+        self.lbl_metrics   = self._card(cards_frame, "AVG-A.TP-T.TP-EFF", "—", WHITE, 5)
 
-        # ── Console ───────────────────────────
-        log_frame = ttk.LabelFrame(self.root, text="  📋  Console Output",
-                                   style="Card.TLabelframe")
-        log_frame.grid(row=6, column=0, sticky="nsew", padx=16, pady=(4, 12))
+        # ── Bottom split: Console (left) + Chart (right) ──────
+        bottom = tk.Frame(self.root, bg=BG)
+        bottom.grid(row=6, column=0, sticky="nsew", padx=16, pady=(4, 12))
+        bottom.columnconfigure(0, weight=3)
+        bottom.columnconfigure(1, weight=2)
+        bottom.rowconfigure(0, weight=1)
         self.root.rowconfigure(6, weight=1)
+
+        # ── Console ────────────────────────────────────────
+        log_frame = ttk.LabelFrame(bottom, text="  📋  Console Output",
+                                   style="Card.TLabelframe")
+        log_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
         self.console = scrolledtext.ScrolledText(
             log_frame, height=16,
@@ -285,12 +382,34 @@ class BenchUI:
             spacing1=4, spacing2=2, spacing3=6)
         self.console.pack(fill="both", expand=True, padx=2, pady=2)
 
-        self.console.tag_config("ok",     foreground="#1a7a4a")   # dark green
-        self.console.tag_config("err",    foreground="#c0392b")   # dark red
-        self.console.tag_config("warn",   foreground="#b85c00")   # dark amber
-        self.console.tag_config("info",   foreground="#1a3a6e")   # dark navy
-        self.console.tag_config("muted",  foreground="#7a8a9a")   # muted grey timestamp
-        self.console.tag_config("sep",    foreground="#7c4daa")   # purple separator
+        self.console.tag_config("ok",     foreground="#1a7a4a")
+        self.console.tag_config("err",    foreground="#c0392b")
+        self.console.tag_config("warn",   foreground="#b85c00")
+        self.console.tag_config("info",   foreground="#1a3a6e")
+        self.console.tag_config("muted",  foreground="#7a8a9a")
+        self.console.tag_config("sep",    foreground="#7c4daa")
+
+        # ── Live Chart ─────────────────────────────────────
+        chart_frame = ttk.LabelFrame(bottom, text="  📈  Performance Monitor",
+                                     style="Card.TLabelframe")
+        chart_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        chart_frame.rowconfigure(0, weight=1)
+        chart_frame.columnconfigure(0, weight=1)
+
+        self._fig = Figure(figsize=(5, 6), dpi=88, facecolor="#f8fafc")
+        self._fig.subplots_adjust(hspace=0.55, top=0.95, bottom=0.08,
+                                  left=0.18, right=0.97)
+
+        self._ax_rt  = self._fig.add_subplot(4, 1, 1)
+        self._ax_tps = self._fig.add_subplot(4, 1, 2)
+        self._ax_tpm = self._fig.add_subplot(4, 1, 3)
+        self._ax_eff = self._fig.add_subplot(4, 1, 4)
+
+        self._init_chart_axes()
+
+        self._canvas = FigureCanvasTkAgg(self._fig, master=chart_frame)
+        self._canvas.draw()
+        self._canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
 
     # ── Helper: parameter row ──────────────────────────────────
     def _param_row(self, parent, label, key, default, row, col_offset):
@@ -327,6 +446,26 @@ class BenchUI:
         self.console.configure(state="normal")
         self.console.delete("1.0", "end")
         self.console.configure(state="disabled")
+        self._test_done_flag=False
+        self._stop_flag=False
+        cfg.avg=0
+        cfg.total_response_time=0
+        cfg.samples_started=0
+        cfg.samples_completed=0
+        cfg.running_users=0
+        cfg.current_errors=0
+        cfg.error_percent=0
+        cfg.el=0
+        cfg.stop_requested=False
+        self.users = 0
+        # reset chart buffers
+        self._chart_time=[]; self._chart_avg_rt=[]; self._chart_tps=[]
+        self._chart_tpm=[]; self._chart_eff=[]
+        for ax in (self._ax_rt, self._ax_tps, self._ax_tpm, self._ax_eff):
+            ax.cla()
+        self._init_chart_axes()
+        self._canvas.draw_idle()
+        self.root.title("⚡ Performance Bench Test — Control Panel")
 
     # ── Parameter parsing ─────────────────────────────────────
     def _apply_params(self):
@@ -353,31 +492,39 @@ class BenchUI:
 
     # ── DB init ───────────────────────────────────────────────
     def _init_db(self):
-        count = sum(1 for f in os.listdir("./db")
-                    if f.startswith(cfg.project_name) and f.endswith(".db"))
-        cfg.db_filename = (f"{cfg.project_name}.db" if count == 0
-                           else f"{cfg.project_name}_{count}.db")
+        cfg.db_filename = f"{cfg.project_name}_{cfg.users}users_{cfg.runfor}mi_duration_{time.time()}.db"
         shutil.copy("./templates/template.db", f"./db/{cfg.db_filename}")
-        self.lbl_db.set(cfg.db_filename)
+        #self.lbl_db.set(cfg.db_filename)
+        self.root.title(f"⚡ Performance Bench Test — Control Panel - [{cfg.db_filename}]")
 
     # ── Start ─────────────────────────────────────────────────
     def _start_test(self):
         if not self._apply_params():
             return
+
+        cfg.avg=0
+        cfg.total_response_time=0
+        cfg.samples_started=0
+        cfg.samples_completed=0
+        cfg.running_users=0
+        cfg.current_errors=0
+        cfg.error_percent=0
+        cfg.el=0
+        cfg.stop_requested = False
         self._init_db()
-        self._stop_flag      = False
-        cfg.stop_requested   = False          # ← reset global stop flag
+        self._stop_flag      = False         # ← reset global stop flag
+        self._test_done_flag = False
         self._total_suites = max(1, (cfg.stop_at_user - cfg.users) // max(1, cfg.user_step) + 1)
         self._suite_num    = 0
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.progress_var.set(0)
 
-        try:
-            with open("./data.json") as f:
-                cfg.requests_data = json.load(f)
-        except Exception:
-            pass
+        #try:
+        #    with open("./data.json") as f:
+        #        cfg.requests_data = json.load(f)
+        #except Exception:
+        #    pass
 
         self._log("━" * 55, "sep")
         self._log(f"TEST STARTED  ·  Project: {cfg.project_name}", "info")
@@ -390,6 +537,7 @@ class BenchUI:
     # ── Stop ──────────────────────────────────────────────────
     def _stop_test(self):
         self._stop_flag     = True
+        cfg.stop_requested = True
         cfg.error_percent   = cfg.error_threshold
         self._log("⛔  Stop requested by user.", "warn")
         self.btn_stop.configure(state="disabled")
@@ -397,6 +545,13 @@ class BenchUI:
 
     # ── Test loop (background thread) ─────────────────────────
     def _run_all_suites(self):
+        
+        runnable_tasks = [obj for name, obj in inspect.getmembers(api_requests) if
+                      inspect.isfunction(obj) and getattr(obj, 'is_task', False)
+                      and getattr(obj, 'enabled', True) ]
+        
+        w = [runnable_task.weight for runnable_task in runnable_tasks]        
+                      
         while cfg.users > 0 and cfg.users <= cfg.stop_at_user:
             if self._stop_flag or cfg.stop_requested:
                 break
@@ -409,6 +564,7 @@ class BenchUI:
             cfg.samples_completed = 0
             cfg.running_users   = 0
             cfg.error_percent   = 0
+            task_list = task_propotion(runnable_tasks, cfg.users, w)
 
             pct = min(100, int((self._suite_num - 1) / self._total_suites * 100))
             self.root.after(0, lambda p=pct: self.progress_var.set(p))
@@ -421,9 +577,14 @@ class BenchUI:
             for idx in range(cfg.users):
                 if self._stop_flag or cfg.stop_requested:
                     break
+                    
+                api_requests_instance = api_requests()
+                selected_thread_task = task_list[idx]
+                thread_task = selected_thread_task.__get__(api_requests_instance, api_requests)
+                
                 cfg.running_users = idx + 1
                 t_name  = f"User-{idx+1}"
-                worker  = UserThread(t_name, self._log)
+                worker  = UserThread(t_name, thread_task, self._log)
                 t = threading.Thread(target=worker.run, daemon=True)
                 threads.append(t)
                 t.start()
@@ -450,8 +611,12 @@ class BenchUI:
                       f"  ·  Errors: {cfg.current_errors}"
                       f"  ·  Error%: {cfg.error_percent:.2f}%", "warn")
 
-            if cfg.error_percent >= cfg.error_threshold or self._stop_flag or cfg.stop_requested:
-                self._log("⚠️  Error threshold reached or test stopped.", "err")
+            if cfg.error_percent >= cfg.error_threshold:
+                self._log("⛔  Error threshold reached.", "err")
+                break
+
+            if cfg.stop_requested or self._stop_flag :
+                self._log("⚠️  Stop requested, ending test.", "warn")
                 break
 
             cfg.users += cfg.user_step
@@ -463,18 +628,93 @@ class BenchUI:
         self._log("━" * 55, "sep")
         self.root.after(0, lambda: self.btn_start.configure(state="normal"))
         self.root.after(0, lambda: self.btn_stop.configure(state="disabled"))
+        self._test_done_flag=True
+
+    # ── Chart helpers ─────────────────────────────────────────
+    def _init_chart_axes(self):
+        for ax, title, colour in [
+            (self._ax_rt,  "Avg Response Time (s)", "#1a7a4a"),
+            (self._ax_tps, "Throughput (t/s)",       "#7c4daa"),
+            (self._ax_tpm, "Transactions / min",      "#1e3a5f"),
+            (self._ax_eff, "Efficiency (%)",          "#b85c00"),
+        ]:
+            ax.set_title(title, fontsize=7, color="#1a1a2e", pad=3)
+            ax.tick_params(labelsize=6)
+            ax.set_facecolor("#eef2f7")
+            ax.grid(True, linestyle="--", linewidth=0.4, color="#cccccc")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.plot([], [], color=colour, linewidth=1.4)
+
+    def _update_chart(self, elapsed, avg_rt, tps, tpm, eff):
+        self._chart_time.append(elapsed)
+        self._chart_avg_rt.append(avg_rt)
+        self._chart_tps.append(tps)
+        self._chart_tpm.append(tpm)
+        self._chart_eff.append(eff)
+
+        for lst in (self._chart_time, self._chart_avg_rt,
+                    self._chart_tps, self._chart_tpm, self._chart_eff):
+            if len(lst) > self._MAX_POINTS:
+                del lst[0]
+
+        t = self._chart_time
+
+        def _redraw(ax, data, colour, label):
+            ax.cla()
+            ax.set_title(label, fontsize=7, color="#1a1a2e", pad=3)
+            ax.tick_params(labelsize=6)
+            ax.set_facecolor("#eef2f7")
+            ax.grid(True, linestyle="--", linewidth=0.4, color="#cccccc")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.plot(t, data, color=colour, linewidth=1.4)
+            if data:
+                ax.set_xlim(t[0], max(t[-1], t[0] + 1))
+                ax.fill_between(t, data, alpha=0.12, color=colour)
+                ax.annotate(f"{data[-1]:.2f}", xy=(t[-1], data[-1]),
+                            fontsize=6, color=colour,
+                            xytext=(3, 3), textcoords="offset points")
+
+        _redraw(self._ax_rt,  self._chart_avg_rt, "#1a7a4a", "Avg Response Time (s)")
+        _redraw(self._ax_tps, self._chart_tps,    "#7c4daa", "Throughput (t/s)")
+        _redraw(self._ax_tpm, self._chart_tpm,    "#1e3a5f", "Transactions / min")
+        _redraw(self._ax_eff, self._chart_eff,    "#b85c00", "Efficiency (%)")
+
+        self._canvas.draw_idle()
 
     # ── Live ticker (every 1 s) ───────────────────────────────
     def _tick(self):
-        if not self._stop_flag:
+        if not self._stop_flag and not self._test_done_flag:
             self.lbl_users.set(str(cfg.running_users))
             self.lbl_samples.set(str(cfg.samples_started))
             self.lbl_errors.set(str(cfg.current_errors))
             self.lbl_error_pct.set(f"{cfg.error_percent:.1f}%")
             if cfg.test_start_time:
-                el = int(time.time() - cfg.test_start_time)
-                self.lbl_elapsed.set(f"{el//60:02d}:{el%60:02d}")
+                self.users = max(cfg.running_users, self.users)
+                cfg.el += 1
+                self.lbl_elapsed.set(f"{cfg.el//60:02d}:{cfg.el%60:02d}")
+                try:
+                    el = int(cfg.el) or 1
+                    tps = cfg.samples_started / el
+                    tpm = tps * 60
+                    ttp = round(self.users / cfg.avg, 2) if cfg.avg else 0
+                    eff = round((tps / (self.users / cfg.avg)) * 100, 1) if cfg.avg else 0
+                    self.lbl_metrics.set(
+                        f"{cfg.avg:.2f}s - {tps:.2f}t/s - {ttp:.2f}t/s - {eff:.0f}%"
+                    )
+                    self._update_chart(
+                        elapsed=el,
+                        avg_rt=round(cfg.avg, 3),
+                        tps=round(tps, 3),
+                        tpm=round(tpm, 2),
+                        eff=round(eff, 1),
+                    )
+                except Exception:
+                    pass
             self.root.after(1000, self._tick)
+        else:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
