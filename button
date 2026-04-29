@@ -1,0 +1,5 @@
+<div class="buttonsWrapper">
+<button id="decline-btn" class="buttonWrapper buttonDecline" tabindex="0">Decline</button>
+<button class="buttonWrapper buttonAccept" tabindex="0">Agree</button>
+</div>
+
